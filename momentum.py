@@ -1,274 +1,207 @@
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from binance.client import Client
+from concurrent.futures import ThreadPoolExecutor
+import warnings
 
-class MomentumAnalyzer:
-    def __init__(self, data):
-        self.data = data.copy()  # Make a copy of input data
+class OptimizedMomentumAnalyzer:
+    def __init__(self, data, batch_size=1000):
+        self.data = data.copy()
+        self.batch_size = batch_size
         self.signals = pd.DataFrame(index=self.data.index)
-        self.results = {}
+        self.performance_scores = {}
         
-    def calculate_ema_trend(self, ema_period=20, trend_length=3):
-        """EMA trend gücünü hesaplar"""
-        # EMA hesaplama
-        self.data.loc[:, 'ema20'] = self.data['Close'].ewm(span=ema_period, adjust=False).mean()
+        # Initialize signal columns
+        for col in ['large_candle', 'micro_gap_up', 'micro_gap_down', 'clean_candle', 'reversal_candle']:
+            self.signals[col] = False
         
-        # Fiyatın EMA üzerinde olup olmadığını kontrol et
-        self.signals.loc[:, 'above_ema'] = self.data['Close'] > self.data['ema20']
+        self._calculate_common_metrics()
+    
+    def _calculate_common_metrics(self):
+        """Calculate commonly used metrics"""
+        self.data['is_green'] = (self.data['Close'] > self.data['Open']).astype(bool)
+        self.data['is_red'] = (self.data['Close'] < self.data['Open']).astype(bool)
+        self.data['body_size'] = np.abs(self.data['Close'] - self.data['Open'])
+        self.data['upper_wick'] = self.data['High'] - self.data[['Open', 'Close']].max(axis=1)
+        self.data['lower_wick'] = self.data[['Open', 'Close']].min(axis=1) - self.data['Low']
+        self.data['avg_body_size'] = self.data['body_size'].rolling(window=3, min_periods=1).mean()
+    
+    def _calculate_batch_signals(self, start_idx, end_idx):
+        """Calculate signals for a batch"""
+        batch_data = self.data.iloc[start_idx:end_idx].copy()
+        signals = pd.DataFrame(index=batch_data.index)
         
-        # Trend başlangıç noktalarını bul
-        self.signals.loc[:, 'trend_start'] = (
-            (self.signals['above_ema'] != self.signals['above_ema'].shift(1)) & 
-            (self.signals['above_ema'] == True)
+        # Large candle
+        signals['large_candle'] = (batch_data['body_size'] > batch_data['avg_body_size'] * 1.1)
+        
+        # Micro gap up
+        prev_is_green = batch_data['is_green'].shift(1).fillna(False)
+        signals['micro_gap_up'] = (
+            (batch_data['Open'] > batch_data['Close'].shift(1)) &
+            batch_data['is_green'] &
+            prev_is_green
         )
         
-        # Trend başarı ve uzunluk kolonlarını başlat
-        self.signals.loc[:, 'trend_success'] = False
-        self.signals.loc[:, 'trend_length'] = 0
+        # Micro gap down
+        prev_is_red = batch_data['is_red'].shift(1).fillna(False)
+        signals['micro_gap_down'] = (
+            (batch_data['Open'] < batch_data['Close'].shift(1)) &
+            batch_data['is_red'] &
+            prev_is_red
+        )
         
-        # Her trend başlangıcı için ileri doğru kontrol
-        for i in range(len(self.data) - trend_length):
-            if self.signals['trend_start'].iloc[i]:
-                success = True
-                length = 0
-                for j in range(1, min(trend_length + 1, len(self.data) - i)):
-                    if not self.signals['above_ema'].iloc[i + j]:
-                        success = False
-                        break
-                    length += 1
-                # loc kullanarak değer ata
-                self.signals.loc[self.signals.index[i], 'trend_success'] = success
-                self.signals.loc[self.signals.index[i], 'trend_length'] = length
+        # Clean candle
+        with np.errstate(divide='ignore', invalid='ignore'):
+            wick_ratio = np.where(
+                batch_data['is_green'],
+                batch_data['upper_wick'] / batch_data['body_size'],
+                batch_data['lower_wick'] / batch_data['body_size']
+            )
+            wick_ratio = np.nan_to_num(wick_ratio, nan=np.inf)
+        
+        signals['clean_candle'] = (wick_ratio <= 0.05)
+        
+        # Reversal candle
+        with np.errstate(divide='ignore', invalid='ignore'):
+            body_size_ratio = batch_data['body_size'] / batch_data['body_size'].shift(1)
+            body_size_ratio = np.nan_to_num(body_size_ratio, nan=0)
+        
+        direction_change = (batch_data['is_green'] != batch_data['is_green'].shift(1)).fillna(False)
+        price_overlap = np.where(
+            batch_data['is_green'],
+            batch_data['Close'] > batch_data['Close'].shift(1),
+            batch_data['Close'] < batch_data['Close'].shift(1)
+        )
+        
+        signals['reversal_candle'] = (
+            direction_change &
+            price_overlap &
+            (body_size_ratio >= 0.6)
+        )
+        
+        return signals.astype(bool)
+    
+    def detect_signals(self):
+        """Detect all signals in parallel"""
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            
+            for start_idx in range(0, len(self.data), self.batch_size):
+                end_idx = min(start_idx + self.batch_size, len(self.data))
+                futures.append(
+                    executor.submit(self._calculate_batch_signals, start_idx, end_idx)
+                )
+            
+            for future in futures:
+                batch_signals = future.result()
+                self.signals.update(batch_signals)
+    
+    def calculate_signal_performance(self, forward_period=3):
+        """Calculate performance metrics for signals"""
+        self.signals['forward_return'] = (
+            self.data['Close'].shift(-forward_period) - self.data['Close']
+        )
+        
+        self.signals['micro_gap'] = (
+            self.signals['micro_gap_up'] | self.signals['micro_gap_down']
+        )
+        
+        for signal_type in ['large_candle', 'micro_gap', 'clean_candle', 'reversal_candle']:
+            mask = self.signals[signal_type]
+            if mask.any():
+                if signal_type == 'micro_gap':
+                    success = (
+                        (self.signals['micro_gap_up'] & (self.signals['forward_return'] > 0)) |
+                        (self.signals['micro_gap_down'] & (self.signals['forward_return'] < 0))
+                    )
+                    success_rate = success[mask].mean() * 100
+                else:
+                    success_rate = (self.signals[mask]['forward_return'] > 0).mean() * 100
+                
+                self.performance_scores[signal_type] = success_rate
+            else:
+                self.performance_scores[signal_type] = 0.0
+    
+    def analyze(self):
+        """Run the complete analysis"""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.detect_signals()
+            self.calculate_signal_performance()
+        return self.performance_scores
 
-    def detect_large_candles(self, lookback_period=3, threshold_multiplier=1.1):
-        """Büyük mumları tespit eder"""
-        self.data.loc[:, 'body_size'] = abs(self.data['Close'] - self.data['Open'])
-        self.data.loc[:, 'avg_body_size'] = self.data['body_size'].rolling(window=lookback_period).mean()
-        self.signals.loc[:, 'large_candle'] = (self.data['body_size'] > 
-                                        self.data['avg_body_size'] * threshold_multiplier)
-        self.signals.loc[:, 'candle_direction'] = np.where(
-            self.data['Close'] > self.data['Open'], 1, -1
-        )
-
-    def detect_micro_gaps(self):
-        """Micro gap'leri tespit eder"""
-        self.data.loc[:, 'prev_close'] = self.data['Close'].shift(1)
-        self.data.loc[:, 'is_bullish'] = (self.data['Close'] > self.data['Open']).astype(int)
-        self.data.loc[:, 'prev_bullish'] = self.data['is_bullish'].shift(1)
-        
-        self.data.dropna(inplace=True)
-        
-        self.signals.loc[:, 'micro_gap_up'] = (
-            (self.data['is_bullish'] == 1) & 
-            (self.data['prev_bullish'] == 1) & 
-            (self.data['Open'] > self.data['prev_close'])
-        ).astype(bool)
-        
-        self.signals.loc[:, 'micro_gap_down'] = (
-            (self.data['is_bullish'] == 0) & 
-            (self.data['prev_bullish'] == 0) & 
-            (self.data['Open'] < self.data['prev_close'])
-        ).astype(bool)
-
-    def detect_clean_candles(self, wick_threshold=0.03):
-        """Trend yönünde fitilsiz/az fitilli mumları tespit eder"""
-        body_size = abs(self.data['Close'] - self.data['Open'])
-        
-        upper_wick = np.where(
-            self.data['Close'] > self.data['Open'],
-            self.data['High'] - self.data['Close'],
-            0
-        )
-        upper_wick_ratio = np.where(body_size != 0, upper_wick / body_size, 0)
-        
-        lower_wick = np.where(
-            self.data['Close'] < self.data['Open'],
-            self.data['Close'] - self.data['Low'],
-            0
-        )
-        lower_wick_ratio = np.where(body_size != 0, lower_wick / body_size, 0)
-        
-        self.signals.loc[:, 'clean_bullish'] = (
-            (self.data['Close'] > self.data['Open']) & 
-            (upper_wick_ratio <= wick_threshold)
-        )
-        
-        self.signals.loc[:, 'clean_bearish'] = (
-            (self.data['Close'] < self.data['Open']) & 
-            (lower_wick_ratio <= wick_threshold)
-        )
-
-    def calculate_momentum_signals(self, forward_period=2):
-        """Momentum sinyallerini hesaplar"""
-        self.signals.loc[:, 'forward_return'] = self.data['Close'].shift(-forward_period) - self.data['Close']
-        self.signals.loc[:, 'momentum_success'] = (
-            self.signals['forward_return'] * self.signals['candle_direction'] > 0
-        )
-        
-        self.signals.loc[:, 'gap_success'] = (
-            (self.signals['micro_gap_up'] & (self.signals['forward_return'] > 0)) |
-            (self.signals['micro_gap_down'] & (self.signals['forward_return'] < 0))
-        )
-        
-        self.signals.loc[:, 'clean_success'] = (
-            (self.signals['clean_bullish'] & (self.signals['forward_return'] > 0)) |
-            (self.signals['clean_bearish'] & (self.signals['forward_return'] < 0))
-        )
-
-    def analyze_performance(self):
-        """Tüm momentum sinyallerinin performans analizini yapar"""
-        valid_signals = self.signals[self.signals['large_candle']].copy()
-        total_signals = len(valid_signals)
-        successful_signals = valid_signals['momentum_success'].sum()
-        
-        gap_signals = len(self.signals[self.signals['micro_gap_up'] | self.signals['micro_gap_down']])
-        gap_success = self.signals['gap_success'].sum()
-        
-        clean_signals = len(self.signals[self.signals['clean_bullish'] | self.signals['clean_bearish']])
-        clean_success = self.signals['clean_success'].sum()
-        
-        trend_signals = len(self.signals[self.signals['trend_start']])
-        trend_success = self.signals['trend_success'].sum()
-        avg_trend_length = self.signals[self.signals['trend_start']]['trend_length'].mean()
-        
-        self.results = {
-            'Toplam Büyük Mum': total_signals,
-            'Başarılı Büyük Mum': successful_signals,
-            'Büyük Mum Başarı Oranı (%)': (successful_signals / total_signals * 100) if total_signals > 0 else 0,
-            'Micro Gap Sinyal Sayısı': gap_signals,
-            'Micro Gap Başarı Sayısı': gap_success,
-            'Micro Gap Başarı Oranı (%)': (gap_success / gap_signals * 100) if gap_signals > 0 else 0,
-            'Tıraşlı Mum Sayısı': clean_signals,
-            'Tıraşlı Mum Başarı': clean_success,
-            'Tıraşlı Mum Başarı Oranı (%)': (clean_success / clean_signals * 100) if clean_signals > 0 else 0,
-            'EMA Trend Başlangıç Sayısı': trend_signals,
-            'Başarılı EMA Trend Sayısı': trend_success,
-            'EMA Trend Başarı Oranı (%)': (trend_success / trend_signals * 100) if trend_signals > 0 else 0,
-            'Ortalama Trend Uzunluğu': avg_trend_length if not pd.isna(avg_trend_length) else 0
+def get_data_from_binance(symbol, interval, lookback, batch_size=500):
+    """Fetch data from Binance"""
+    try:
+        client = Client("", "")
+        interval_map = {
+            '1m': Client.KLINE_INTERVAL_1MINUTE,
+            '3m': Client.KLINE_INTERVAL_3MINUTE,
+            '5m': Client.KLINE_INTERVAL_5MINUTE,
+            '15m': Client.KLINE_INTERVAL_15MINUTE,
+            '30m': Client.KLINE_INTERVAL_30MINUTE,
+            '1h': Client.KLINE_INTERVAL_1HOUR,
+            '2h': Client.KLINE_INTERVAL_2HOUR,
+            '4h': Client.KLINE_INTERVAL_4HOUR,
+            '6h': Client.KLINE_INTERVAL_6HOUR,
+            '8h': Client.KLINE_INTERVAL_8HOUR,
+            '12h': Client.KLINE_INTERVAL_12HOUR,
+            '1d': Client.KLINE_INTERVAL_1DAY,
         }
         
-        return self.results
-
-    def analyze_combined_signals(self):
-        """Tüm sinyallerin kombinasyonlarını analiz eder"""
-        # Kombinasyon durumlarını oluştur
-        self.signals.loc[:, 'ema_large_candle'] = (
-            self.signals['trend_start'] & 
-            self.signals['large_candle']
-        )
+        all_klines = []
+        remaining = lookback
         
-        self.signals.loc[:, 'ema_clean_candle'] = (
-            self.signals['trend_start'] & 
-            (self.signals['clean_bullish'] | self.signals['clean_bearish'])
-        )
+        while remaining > 0:
+            current_batch = min(batch_size, remaining)
+            batch_klines = client.get_klines(
+                symbol=symbol,
+                interval=interval_map[interval],
+                limit=current_batch
+            )
+            all_klines.extend(batch_klines)
+            remaining -= current_batch
         
-        self.signals.loc[:, 'ema_micro_gap'] = (
-            self.signals['trend_start'] & 
-            (self.signals['micro_gap_up'] | self.signals['micro_gap_down'])
-        )
+        df = pd.DataFrame(all_klines, columns=[
+            'timestamp', 'Open', 'High', 'Low', 'Close', 'Volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
         
-        self.signals.loc[:, 'strong_trend_signal'] = (
-            self.signals['trend_start'] & 
-            self.signals['large_candle'] & 
-            (self.signals['clean_bullish'] | self.signals['clean_bearish'])
-        )
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
         
-        # Her kombinasyonun başarı oranını hesapla
-        results = {}
+        float_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df[float_columns] = df[float_columns].astype('float32')
         
-        # EMA + Büyük Mum
-        ema_large = self.signals[self.signals['ema_large_candle']]
-        if len(ema_large) > 0:
-            success_rate = (ema_large['trend_success'].sum() / len(ema_large)) * 100
-            avg_length = ema_large['trend_length'].mean()
-            results['EMA + Büyük Mum'] = {
-                'Sinyal Sayısı': len(ema_large),
-                'Başarı Oranı': success_rate,
-                'Ortalama Trend Uzunluğu': avg_length
-            }
-        
-        # EMA + Clean Candle
-        ema_clean = self.signals[self.signals['ema_clean_candle']]
-        if len(ema_clean) > 0:
-            success_rate = (ema_clean['trend_success'].sum() / len(ema_clean)) * 100
-            avg_length = ema_clean['trend_length'].mean()
-            results['EMA + Clean Candle'] = {
-                'Sinyal Sayısı': len(ema_clean),
-                'Başarı Oranı': success_rate,
-                'Ortalama Trend Uzunluğu': avg_length
-            }
-        
-        # EMA + Micro Gap
-        ema_gap = self.signals[self.signals['ema_micro_gap']]
-        if len(ema_gap) > 0:
-            success_rate = (ema_gap['trend_success'].sum() / len(ema_gap)) * 100
-            avg_length = ema_gap['trend_length'].mean()
-            results['EMA + Micro Gap'] = {
-                'Sinyal Sayısı': len(ema_gap),
-                'Başarı Oranı': success_rate,
-                'Ortalama Trend Uzunluğu': avg_length
-            }
-        
-        # Güçlü Trend Sinyali (Hepsi Bir Arada)
-        strong_signals = self.signals[self.signals['strong_trend_signal']]
-        if len(strong_signals) > 0:
-            success_rate = (strong_signals['trend_success'].sum() / len(strong_signals)) * 100
-            avg_length = strong_signals['trend_length'].mean()
-            results['Güçlü Trend Sinyali'] = {
-                'Sinyal Sayısı': len(strong_signals),
-                'Başarı Oranı': success_rate,
-                'Ortalama Trend Uzunluğu': avg_length
-            }
-        
-        return results
-
-def get_data_from_yfinance(symbol, period, interval):
-    """yfinance'den veri çeker"""
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
         return df
+        
     except Exception as e:
         print(f"Veri çekme hatası: {e}")
         return None
 
-def run_analysis(symbol, period, interval):
-    """Analizi çalıştırır ve sonuçları gösterir"""
-    ohlc_data = get_data_from_yfinance(symbol, period, interval)
+def main(symbol,interval,lookback):
+    """Main function"""
+    symbol = symbol
+    interval = interval
+    lookback = lookback
+    batch_size = 3000
+    
+    print(f"Analiz başlatılıyor: {symbol} - {interval}")
+    
+    ohlc_data = get_data_from_binance(symbol, interval, lookback, batch_size)
     if ohlc_data is None or ohlc_data.empty:
         print("Veri çekilemedi veya işlem yapılamadı.")
-        return None, None
+        return
     
     print(f"İşlenen mum sayısı: {len(ohlc_data)}")
     
-    analyzer = MomentumAnalyzer(ohlc_data)
+    analyzer = OptimizedMomentumAnalyzer(ohlc_data, batch_size=batch_size)
+    performance_scores = analyzer.analyze()
     
-    analyzer.calculate_ema_trend()
-    analyzer.detect_large_candles()
-    analyzer.detect_micro_gaps()
-    analyzer.detect_clean_candles()
-    analyzer.calculate_momentum_signals()
-    results = analyzer.analyze_performance()
-    combined_results = analyzer.analyze_combined_signals()
-    
-    
-    print("\nSonuçlar:")
-    for metric, value in results.items():
-        if isinstance(value, float):
-            print(f"{metric}: {value:.2f}")
-        else:
-            print(f"{metric}: {value}")
-    
-    print("\nKombinasyon Sonuçları:")
-    for combo, metrics in combined_results.items():
-        print(f"\n{combo}:")
-        for metric, value in metrics.items():
-            if isinstance(value, float):
-                print(f"{metric}: {value:.2f}")
-            else:
-                print(f"{metric}: {value}")
-    
-    return ohlc_data, analyzer.signals
+    print("\nPerformans Skorları:")
+    for signal, score in performance_scores.items():
+        print(f"{signal}: {score:.2f}%")
 
 if __name__ == "__main__":
-    run_analysis(symbol='BTC-USD', interval='5m', period='1mo')
+    main('BTCUSDT','5m',4000)
