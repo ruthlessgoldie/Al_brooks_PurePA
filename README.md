@@ -1,57 +1,59 @@
-# Momentum Analyzer
+# Optimized Momentum Analyzer V2
 
 ## Overview
-This Python script provides a comprehensive momentum trading signal analysis tool for financial markets. It uses technical indicators and candlestick pattern analysis to detect potential trading opportunities.
+Advanced trading signal analysis tool with parallel processing for efficient cryptocurrency market analysis.
 
 ## Features
-- EMA (Exponential Moving Average) trend detection
-- Large candle identification
-- Micro gap detection
-- Clean candle pattern recognition
-- Performance analysis of trading signals
+- Parallel signal detection
+- Multiple signal types:
+  - Large candle detection
+  - Micro gap tracking
+  - Clean candle identification
+  - Reversal candle recognition
+- Performance scoring for each signal type
+- Binance API integration
 
 ## Prerequisites
-- Python 3.7+
-- Required libraries:
-  - pandas
-  - numpy
-  - yfinance
+- Python 3.8+
+- Libraries:
+  ```
+  pandas
+  numpy
+  python-binance
+  ```
 
 ## Installation
 ```bash
-pip install pandas numpy yfinance
+pip install pandas numpy python-binance
 ```
 
-## Usage
+## Configuration
+1. Add Binance API credentials in `get_data_from_binance()`
+2. Customize signal detection parameters
+
+## Usage Example
 ```python
-from momentum import run_analysis
+from optimized_momentum_analyzer import main
 
-# Example: Analyze Bitcoin 5-minute data for the last month
-run_analysis(symbol='BTC-USD', interval='5m', period='1mo')
+# Analyze Bitcoin 5-minute data
+main(symbol='BTCUSDT', interval='5m', lookback=4000)
 ```
 
-## Key Analysis Methods
-- `calculate_ema_trend()`: Calculates EMA trend strength
-- `detect_large_candles()`: Identifies significant price movement candles
-- `detect_micro_gaps()`: Detects small price gaps
-- `detect_clean_candles()`: Finds candles with minimal wicks
-- `analyze_performance()`: Generates comprehensive trading signal performance metrics
+## Signal Types
+- Large Candle: Significant price movement
+- Micro Gap: Small price discontinuities
+- Clean Candle: Minimal wick patterns
+- Reversal Candle: Potential trend change indicators
 
-## Output
-The script provides detailed performance metrics including:
-- Signal success rates
-- Number of signals
-- Average trend length
-- Performance of combined signal strategies
+## Performance Metrics
+Outputs success rates for each signal type as percentages.
 
 ## Customization
-Modify parameters in method calls to adjust:
-- EMA periods
-- Candle size thresholds
-- Signal detection criteria
-
-## License
-[Insert your chosen license]
+- Adjust `batch_size` for processing speed
+- Modify `forward_period` in performance calculation
 
 ## Disclaimer
-This tool is for educational purposes. Always conduct thorough research and risk management in trading.
+For educational purposes. Trading involves financial risk.
+
+## License
+MIT
